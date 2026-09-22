@@ -91,6 +91,17 @@ public partial class VirtualDesktopsListPage : ListPage
     private VirtualDesktop[] _desktops;
     private readonly bool _asBand;
 
+    // One ListItem per desktop, reused across refreshes and updated in place.
+    // The dock keys its buttons on the ListItem objects we hand it. Returning
+    // brand-new items on every refresh (i.e. every desktop switch) made it
+    // throw away and recycle every button each time, which could leave the
+    // compact dock with blank icons until it was rebuilt via "Edit".
+    private readonly Dictionary<Guid, CachedItem> _items = new();
+    private readonly object _itemsLock = new();
+    private Guid _currentDesktopId;
+
+    private sealed record CachedItem(ListItem Item, VirtualDesktop Desktop, int Index);
+
     public VirtualDesktopsListPage(bool asBand)
     {
         _asBand = asBand;
@@ -98,6 +109,10 @@ public partial class VirtualDesktopsListPage : ListPage
 
         VirtualDesktop.CurrentChanged += (_, args) => UpdateDesktopsOffUiThread();
         VirtualDesktop.Created += (_, desktop) => UpdateDesktopsOffUiThread();
+        VirtualDesktop.Destroyed += (_, _) => UpdateDesktopsOffUiThread();
+        VirtualDesktop.Moved += (_, _) => UpdateDesktopsOffUiThread();
+        VirtualDesktop.Renamed += (_, _) => UpdateDesktopsOffUiThread();
+        VirtualDesktop.WallpaperChanged += (_, _) => UpdateDesktopsOffUiThread();
         VirtualDesktopSettings.Instance.Settings.SettingsChanged += (_, _) => UpdateDesktopsOffUiThread();
 
         _desktops = VirtualDesktop.GetDesktops();
@@ -107,18 +122,69 @@ public partial class VirtualDesktopsListPage : ListPage
 
     public override IListItem[] GetItems()
     {
-        VirtualDesktop[] desktops = [];
-
-        List<IListItem> items = new(_desktops.Length);
-        DebugPrint($"Current desktop is {VirtualDesktop.Current}");
-
-        for (int i = 0; i < _desktops.Length; i++)
+        lock (_itemsLock)
         {
-            VirtualDesktop desktop = _desktops[i];
-            items.Add(DesktopToItem(desktop, _asBand, i));
+            VirtualDesktop[] desktops = _desktops;
+            Guid currentDesktopId = GetCurrentDesktopId();
+
+            List<IListItem> items = new(desktops.Length);
+            HashSet<Guid> seenDesktopIds = [];
+
+            for (int i = 0; i < desktops.Length; i++)
+            {
+                VirtualDesktop desktop = desktops[i];
+                try
+                {
+                    items.Add(GetOrUpdateItem(desktop, i, desktop.Id == currentDesktopId));
+                    seenDesktopIds.Add(desktop.Id);
+                }
+                catch (Exception e)
+                {
+                    // The desktop may have been destroyed since we enumerated
+                    // it. Skip it rather than failing the whole list.
+                    DebugPrint($"GetItems: skipping desktop {i}\n{e.Message}");
+                }
+            }
+
+            foreach (Guid staleId in _items.Keys.Where(id => !seenDesktopIds.Contains(id)).ToList())
+            {
+                _items.Remove(staleId);
+            }
+
+            return items.ToArray();
         }
-        DebugPrint(string.Join(',', items.Select(i => i.Command.ToString())));
-        return items.ToArray();
+    }
+
+    private Guid GetCurrentDesktopId()
+    {
+        try
+        {
+            _currentDesktopId = VirtualDesktop.Current.Id;
+        }
+        catch (Exception e)
+        {
+            // Keep the last known current desktop rather than failing GetItems.
+            DebugPrint($"GetCurrentDesktopId\n{e.Message}");
+        }
+
+        return _currentDesktopId;
+    }
+
+    private ListItem GetOrUpdateItem(VirtualDesktop desktop, int index, bool isCurrent)
+    {
+        // Command IDs are based on the desktop's position, so a desktop that
+        // moved gets a new item. So does one whose wrapper object changed
+        // (e.g. after explorer restarts), so the commands never hold a stale one.
+        if (!_items.TryGetValue(desktop.Id, out CachedItem? cached) ||
+            cached.Index != index ||
+            !ReferenceEquals(cached.Desktop, desktop))
+        {
+            cached = new CachedItem(DesktopToItem(desktop, _asBand, index), desktop, index);
+            _items[desktop.Id] = cached;
+        }
+
+        ApplyDesktopState(cached.Item, desktop, _asBand, index, isCurrent);
+        return cached.Item;
     }
 
     private void UpdateDesktopsOffUiThread()
@@ -131,21 +197,55 @@ public partial class VirtualDesktopsListPage : ListPage
 
     private void UpdateDesktopsOnUiThread()
     {
-        _desktops = VirtualDesktop.GetDesktops();
+        try
+        {
+            _desktops = VirtualDesktop.GetDesktops();
+        }
+        catch (Exception e)
+        {
+            DebugPrint($"UpdateDesktops\n{e.Message}\n{e.StackTrace}");
+            return;
+        }
+
         RaiseItemsChanged();
     }
 
+    // Builds the parts of an item that don't change while the desktop stays
+    // at the same position: its commands. ApplyDesktopState fills in the rest.
     private static ListItem DesktopToItem(VirtualDesktop desktop, bool asBand, int index)
     {
-        bool isCurrent = desktop == VirtualDesktop.Current;
-        if (isCurrent)
+        List<CommandContextItem> contextItems = [
+            new CommandContextItem(new MoveWindowToDesktopCommand(desktop, index, false))
+            {
+                Title = "Move window here",
+            },
+            new CommandContextItem(new MoveWindowToDesktopCommand(desktop, index, true))
+            {
+                Title = "Move window and switch",
+            },
+        ];
+
+        if (asBand)
         {
-            DebugPrint($"    * I ({desktop.ToString()}) am current");
+            // in the band we only show the context menu, not the command in the list item itself
+            contextItems.Insert(0, new CommandContextItem(new SwitchToDesktopCommand(desktop, asBand: false, index))
+            {
+                Title = "Switch to desktop",
+                Icon = Icons.Switchcon,
+            });
         }
-        else
+
+        return new ListItem(new SwitchToDesktopCommand(desktop, asBand, index))
         {
-            DebugPrint($"    - I am NOT current");
-        }
+            MoreCommands = contextItems.ToArray(),
+        };
+    }
+
+    // Updates the visible state of an item (icon, and for the list page its
+    // title, details and tags). Only properties that actually changed are
+    // set, so the dock isn't asked to reload icons that are already right.
+    private static void ApplyDesktopState(ListItem li, VirtualDesktop desktop, bool asBand, int index, bool isCurrent)
+    {
         IconInfo wallpaperIconInfo = new IconInfo(desktop.WallpaperPath);
 
         // Possible good icons sets:
@@ -164,54 +264,59 @@ public partial class VirtualDesktopsListPage : ListPage
                 : VirtualDesktopSettings.GetIconForValue(VirtualDesktopSettings.Instance.InactiveDesktopIcon, desktop.WallpaperPath)) :
             wallpaperIconInfo;
 
-        List<CommandContextItem> contextItems = [
-            new CommandContextItem(new MoveWindowToDesktopCommand(desktop, index, false))
-            {
-                Title = "Move window here",
-            },
-            new CommandContextItem(new MoveWindowToDesktopCommand(desktop, index, true))
-            {
-                Title = "Move window and switch",
-            },
-        ];
-
-        if (asBand)
+        bool iconChanged = !SameIcon(li.Icon, icon);
+        if (iconChanged)
         {
-            // in the band we only show the context menu, not the command in the list item itself
-            contextItems.Insert(0, new CommandContextItem(new SwitchToDesktopCommand(desktop, isCurrent, asBand:false, index))
-            {
-                Title = "Switch to desktop",
-                Icon = Icons.Switchcon,
-            });
+            li.Icon = icon;
         }
-
-        ListItem li = new ListItem(new SwitchToDesktopCommand(desktop, isCurrent, asBand, index))
-        {
-            Icon = icon,
-            MoreCommands = contextItems.ToArray(),
-        };
 
         if (!asBand)
         {
             bool hasName = !string.IsNullOrEmpty(desktop.Name);
             string desktopNumberLabel = $"Desktop {index + 1}";
+            string title = hasName ? desktop.Name : desktopNumberLabel;
+            string subtitle = hasName ? desktopNumberLabel : string.Empty;
 
-            li.Title = hasName ? desktop.Name : desktopNumberLabel;
-            li.Subtitle = hasName ? desktopNumberLabel : string.Empty;
-            Details details = new Details()
+            if (li.Title != title)
             {
-                Title = li.Title,
-                HeroImage = icon,
-            };
-            li.Details = details;
+                li.Title = title;
+            }
 
-            if (isCurrent)
+            if (li.Subtitle != subtitle)
             {
-                li.Tags = [CurrentDesktopTag];
+                li.Subtitle = subtitle;
+            }
+
+            if (iconChanged || li.Details?.Title != title)
+            {
+                li.Details = new Details()
+                {
+                    Title = title,
+                    HeroImage = icon,
+                };
+            }
+
+            bool hasCurrentTag = li.Tags.Length > 0;
+            if (isCurrent != hasCurrentTag)
+            {
+                if (isCurrent)
+                {
+                    li.Tags = [CurrentDesktopTag];
+                }
+                else
+                {
+                    li.Tags = [];
+                }
             }
         }
+    }
 
-        return li;
+    private static bool SameIcon(IIconInfo? a, IIconInfo? b)
+    {
+        return ReferenceEquals(a, b) ||
+            (a is not null && b is not null &&
+             a.Light?.Icon == b.Light?.Icon &&
+             a.Dark?.Icon == b.Dark?.Icon);
     }
 
     private static HWND FindLastNonToolWindow()
@@ -301,16 +406,15 @@ public partial class VirtualDesktopsListPage : ListPage
         }
     }
 
-    private sealed partial class SwitchToDesktopCommand(VirtualDesktop desktop, bool isCurrent, bool asBand, int index) : InvokableCommand
+    private sealed partial class SwitchToDesktopCommand(VirtualDesktop desktop, bool asBand, int index) : InvokableCommand
     {
         public VirtualDesktop Desktop => desktop;
         public override string Name => asBand ? string.Empty : "Switch to desktop";
-        internal bool IsCurrent { get; init; } = isCurrent;
         public override string Id => $"com.zadjii.virtualDesktops.switchTo.{index}";
         public override IconInfo Icon => Icons.Switchcon;
         public override string ToString()
         {
-            return $"{(IsCurrent ? "*" : string.Empty)}{Desktop.ToString()}";
+            return Desktop.ToString();
         }
         public override ICommandResult Invoke()
         {
