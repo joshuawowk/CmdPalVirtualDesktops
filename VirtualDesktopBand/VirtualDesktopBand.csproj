@@ -105,7 +105,9 @@
 
 
 
-	<Target Name="KillRunningExecutable" BeforeTargets="Build;Deploy;Publish">
+	<!-- Hook BeforeBuild, not Build: a BeforeTargets="Build" hook only runs after Build's
+	     dependencies (compile + copy to bin), which is too late to release the file locks. -->
+	<Target Name="KillRunningExecutable" BeforeTargets="BeforeBuild;Deploy;Publish">
 		<PropertyGroup>
 			<ExecutableName>$(AssemblyName).exe</ExecutableName>
 		</PropertyGroup>
