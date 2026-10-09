@@ -91,16 +91,22 @@ public partial class VirtualDesktopsListPage : ListPage
     private VirtualDesktop[] _desktops;
     private readonly bool _asBand;
 
-    // One ListItem per desktop, reused across refreshes and updated in place.
-    // The dock keys its buttons on the ListItem objects we hand it. Returning
-    // brand-new items on every refresh (i.e. every desktop switch) made it
-    // throw away and recycle every button each time, which could leave the
-    // compact dock with blank icons until it was rebuilt via "Edit".
+    // One ListItem per desktop, reused across refreshes ONLY while everything it
+    // shows is unchanged. The host keys its view models on the ListItem objects
+    // we hand it: a reused item keeps its existing button (no churn), and a
+    // desktop whose state changed gets a brand-new item, for which the host
+    // builds a fresh view model and reads the icon/tags (the path the original
+    // code always used). Items are NEVER modified after being handed out. The
+    // host would only see such changes via PropChanged, and relying on that
+    // (raised from inside GetItems) froze the band.
     private readonly Dictionary<Guid, CachedItem> _items = new();
     private readonly object _itemsLock = new();
     private Guid _currentDesktopId;
 
-    private sealed record CachedItem(ListItem Item, VirtualDesktop Desktop, int Index);
+    private sealed record CachedItem(ListItem Item, VirtualDesktop Desktop, int Index, ItemState State);
+
+    // Everything that affects how an item looks.
+    private readonly record struct ItemState(bool IsCurrent, string IconSetting, string? Name, string? WallpaperPath);
 
     public VirtualDesktopsListPage(bool asBand)
     {
@@ -122,10 +128,22 @@ public partial class VirtualDesktopsListPage : ListPage
 
     public override IListItem[] GetItems()
     {
+        VirtualDesktop[] desktops = _desktops;
+
+        // Ask explorer before taking the lock, so no cross-process call is made
+        // while holding it.
+        Guid? current = TryGetCurrentDesktopId();
+        string activeIcon = VirtualDesktopSettings.Instance.ActiveDesktopIcon;
+        string inactiveIcon = VirtualDesktopSettings.Instance.InactiveDesktopIcon;
+
         lock (_itemsLock)
         {
-            VirtualDesktop[] desktops = _desktops;
-            Guid currentDesktopId = GetCurrentDesktopId();
+            if (current is Guid id)
+            {
+                _currentDesktopId = id;
+            }
+
+            Guid currentDesktopId = _currentDesktopId;
 
             List<IListItem> items = new(desktops.Length);
             HashSet<Guid> seenDesktopIds = [];
@@ -135,13 +153,21 @@ public partial class VirtualDesktopsListPage : ListPage
                 VirtualDesktop desktop = desktops[i];
                 try
                 {
-                    items.Add(GetOrUpdateItem(desktop, i, desktop.Id == currentDesktopId));
+                    bool isCurrent = desktop.Id == currentDesktopId;
+
+                    // The list page always shows the wallpaper, so the icon
+                    // settings don't affect it.
+                    string iconSetting = !_asBand ? string.Empty : isCurrent ? activeIcon : inactiveIcon;
+
+                    items.Add(GetOrCreateItem(desktop, i, isCurrent, iconSetting));
                     seenDesktopIds.Add(desktop.Id);
                 }
                 catch (Exception e)
                 {
-                    // The desktop may have been destroyed since we enumerated
-                    // it. Skip it rather than failing the whole list.
+                    // Defensive: skip a desktop that fails rather than failing
+                    // the whole list. (Destroyed desktops don't throw here, since
+                    // the wrapper's properties are cached; they drop out when the
+                    // Destroyed event refreshes _desktops.)
                     DebugPrint($"GetItems: skipping desktop {i}\n{e.Message}");
                 }
             }
@@ -155,36 +181,47 @@ public partial class VirtualDesktopsListPage : ListPage
         }
     }
 
-    private Guid GetCurrentDesktopId()
+    private static Guid? TryGetCurrentDesktopId()
     {
         try
         {
-            _currentDesktopId = VirtualDesktop.Current.Id;
+            return VirtualDesktop.Current.Id;
         }
         catch (Exception e)
         {
-            // Keep the last known current desktop rather than failing GetItems.
-            DebugPrint($"GetCurrentDesktopId\n{e.Message}");
+            // The caller keeps the last known current desktop rather than failing GetItems.
+            DebugPrint($"TryGetCurrentDesktopId\n{e.Message}");
+            return null;
         }
-
-        return _currentDesktopId;
     }
 
-    private ListItem GetOrUpdateItem(VirtualDesktop desktop, int index, bool isCurrent)
+    private ListItem GetOrCreateItem(VirtualDesktop desktop, int index, bool isCurrent, string iconSetting)
     {
-        // Command IDs are based on the desktop's position, so a desktop that
-        // moved gets a new item. So does one whose wrapper object changed
-        // (e.g. after explorer restarts), so the commands never hold a stale one.
-        if (!_items.TryGetValue(desktop.Id, out CachedItem? cached) ||
-            cached.Index != index ||
-            !ReferenceEquals(cached.Desktop, desktop))
+        // Only track the wallpaper where it is shown, so e.g. a wallpaper
+        // slideshow doesn't rebuild glyph-icon band items.
+        // The band doesn't show the name, so only track it for the list page.
+        bool showsWallpaper = !_asBand || iconSetting == VirtualDesktopSettings.WallpaperValue;
+        ItemState state = new(
+            isCurrent,
+            iconSetting,
+            _asBand ? null : desktop.Name,
+            showsWallpaper ? desktop.WallpaperPath : null);
+
+        // Reuse the item only if nothing it shows has changed. Command IDs are
+        // based on the desktop's position, so a desktop that moved gets a new
+        // item. So does one whose wrapper object changed (e.g. after explorer
+        // restarts), so the commands never hold a stale one.
+        if (_items.TryGetValue(desktop.Id, out CachedItem? cached) &&
+            cached.Index == index &&
+            ReferenceEquals(cached.Desktop, desktop) &&
+            cached.State == state)
         {
-            cached = new CachedItem(DesktopToItem(desktop, _asBand, index), desktop, index);
-            _items[desktop.Id] = cached;
+            return cached.Item;
         }
 
-        ApplyDesktopState(cached.Item, desktop, _asBand, index, isCurrent);
-        return cached.Item;
+        ListItem item = DesktopToItem(desktop, _asBand, index, isCurrent, iconSetting);
+        _items[desktop.Id] = new CachedItem(item, desktop, index, state);
+        return item;
     }
 
     private void UpdateDesktopsOffUiThread()
@@ -210,10 +247,26 @@ public partial class VirtualDesktopsListPage : ListPage
         RaiseItemsChanged();
     }
 
-    // Builds the parts of an item that don't change while the desktop stays
-    // at the same position: its commands. ApplyDesktopState fills in the rest.
-    private static ListItem DesktopToItem(VirtualDesktop desktop, bool asBand, int index)
+    // Builds a complete item for the desktop's current state. The item is not
+    // modified after this: when its state changes, GetOrCreateItem builds a new one.
+    private static ListItem DesktopToItem(VirtualDesktop desktop, bool asBand, int index, bool isCurrent, string iconSetting)
     {
+        IconInfo wallpaperIconInfo = new IconInfo(desktop.WallpaperPath);
+
+        // Possible good icons sets:
+        // * CheckboxFillIcon : CheckboxEmptyIcon for squares
+        // * StatusCircleIcon : CircleFillBadge12Icon for a small circle vs big circle
+        // * ToggleFilledIcon : CircleFillBadge12Icon for big oval vs circle
+        // * wallpaperIconInfo : CircleFillBadge12Icon for wallpaper vs circle
+        //
+        // What we really should have is a setting for 
+        // * active desktop icon
+        // * inactive desktop icon
+
+        IconInfo icon = asBand ?
+            VirtualDesktopSettings.GetIconForValue(iconSetting, desktop.WallpaperPath) :
+            wallpaperIconInfo;
+
         List<CommandContextItem> contextItems = [
             new CommandContextItem(new MoveWindowToDesktopCommand(desktop, index, false))
             {
@@ -235,88 +288,32 @@ public partial class VirtualDesktopsListPage : ListPage
             });
         }
 
-        return new ListItem(new SwitchToDesktopCommand(desktop, asBand, index))
+        ListItem li = new ListItem(new SwitchToDesktopCommand(desktop, asBand, index))
         {
+            Icon = icon,
             MoreCommands = contextItems.ToArray(),
         };
-    }
-
-    // Updates the visible state of an item (icon, and for the list page its
-    // title, details and tags). Only properties that actually changed are
-    // set, so the dock isn't asked to reload icons that are already right.
-    private static void ApplyDesktopState(ListItem li, VirtualDesktop desktop, bool asBand, int index, bool isCurrent)
-    {
-        IconInfo wallpaperIconInfo = new IconInfo(desktop.WallpaperPath);
-
-        // Possible good icons sets:
-        // * CheckboxFillIcon : CheckboxEmptyIcon for squares
-        // * StatusCircleIcon : CircleFillBadge12Icon for a small circle vs big circle
-        // * ToggleFilledIcon : CircleFillBadge12Icon for big oval vs circle
-        // * wallpaperIconInfo : CircleFillBadge12Icon for wallpaper vs circle
-        //
-        // What we really should have is a setting for 
-        // * active desktop icon
-        // * inactive desktop icon
-
-        IconInfo icon = asBand ?
-            (isCurrent
-                ? VirtualDesktopSettings.GetIconForValue(VirtualDesktopSettings.Instance.ActiveDesktopIcon, desktop.WallpaperPath)
-                : VirtualDesktopSettings.GetIconForValue(VirtualDesktopSettings.Instance.InactiveDesktopIcon, desktop.WallpaperPath)) :
-            wallpaperIconInfo;
-
-        bool iconChanged = !SameIcon(li.Icon, icon);
-        if (iconChanged)
-        {
-            li.Icon = icon;
-        }
 
         if (!asBand)
         {
             bool hasName = !string.IsNullOrEmpty(desktop.Name);
             string desktopNumberLabel = $"Desktop {index + 1}";
-            string title = hasName ? desktop.Name : desktopNumberLabel;
-            string subtitle = hasName ? desktopNumberLabel : string.Empty;
 
-            if (li.Title != title)
+            li.Title = hasName ? desktop.Name : desktopNumberLabel;
+            li.Subtitle = hasName ? desktopNumberLabel : string.Empty;
+            li.Details = new Details()
             {
-                li.Title = title;
-            }
+                Title = li.Title,
+                HeroImage = icon,
+            };
 
-            if (li.Subtitle != subtitle)
+            if (isCurrent)
             {
-                li.Subtitle = subtitle;
-            }
-
-            if (iconChanged || li.Details?.Title != title)
-            {
-                li.Details = new Details()
-                {
-                    Title = title,
-                    HeroImage = icon,
-                };
-            }
-
-            bool hasCurrentTag = li.Tags.Length > 0;
-            if (isCurrent != hasCurrentTag)
-            {
-                if (isCurrent)
-                {
-                    li.Tags = [CurrentDesktopTag];
-                }
-                else
-                {
-                    li.Tags = [];
-                }
+                li.Tags = [CurrentDesktopTag];
             }
         }
-    }
 
-    private static bool SameIcon(IIconInfo? a, IIconInfo? b)
-    {
-        return ReferenceEquals(a, b) ||
-            (a is not null && b is not null &&
-             a.Light?.Icon == b.Light?.Icon &&
-             a.Dark?.Icon == b.Dark?.Icon);
+        return li;
     }
 
     private static HWND FindLastNonToolWindow()
